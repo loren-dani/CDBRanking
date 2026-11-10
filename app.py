@@ -1,7 +1,4 @@
-from datetime import date, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -120,15 +117,18 @@ real = ipca[ipca.Tipo.map(normalizar).eq('REALIZADO')].sort_values('Data')
 if real.empty or selic.Data.dropna().empty:
     st.error('As bases precisam conter IPCA realizado e histórico de Selic.')
     st.stop()
-hoje = datetime.now(ZoneInfo('America/Sao_Paulo')).date()
 ultima_selic = selic.Data.max().date()
 ultimo_ipca = real.Data.max()
 st.caption(f'Cobertura dos arquivos: Selic até {ultima_selic:%d/%m/%Y}; '
            f'IPCA realizado até {ultimo_ipca:%m/%Y}.')
 with st.sidebar:
     st.header('Configuração')
-    ref = st.date_input('Data Base', value=hoje, max_value=hoje,
-                        help='Início do trecho futuro; o histórico permanece igual nos três cenários.')
+    if btg.Data_Emissao.dropna().empty:
+        st.error('A base não contém datas de emissão válidas.')
+        st.stop()
+    ref = btg.Data_Emissao.max().date()
+    st.date_input('Data Base', value=ref, disabled=True,
+                  help='Última data de emissão disponível no BTG Consolidado; atualizada ao substituir a base.')
     emissoes = sorted(btg.loc[btg.Data_Emissao.le(pd.Timestamp(ref)), 'Data_Emissao'].dropna().dt.date.unique(), reverse=True)
     if not emissoes:
         st.warning('Não há ofertas anteriores à referência escolhida.')
@@ -216,6 +216,23 @@ with st.expander('Resumo das pendências', expanded=not bool(ok.any())):
 st.download_button('Baixar cálculo completo (CSV)', resultado.to_csv(index=False).encode('utf-8-sig'),
                    file_name=f'ranking_{emissao}_{ref}.csv', mime='text/csv', on_click='ignore')
 st.subheader('Evolução da TAE • Top 5 da Data Base')
+primeira_emissao = btg.Data_Emissao.min().date()
+modo_periodo = st.radio('Período dos gráficos', ['Desde o início da base', 'Escolher período'], horizontal=True)
+inicio_grafico, fim_grafico = primeira_emissao, ref
+if modo_periodo == 'Escolher período':
+    esquerda, direita = st.columns(2)
+    with esquerda:
+        inicio_grafico = st.date_input('Início do gráfico', value=primeira_emissao,
+                                       min_value=primeira_emissao, max_value=ref)
+    with direita:
+        fim_grafico = st.date_input('Fim do gráfico', value=ref,
+                                    min_value=primeira_emissao, max_value=ref)
+    if inicio_grafico > fim_grafico:
+        st.warning('O início do gráfico deve ser anterior ou igual ao fim.')
+        st.stop()
+st.caption(f'Período exibido: {inicio_grafico:%d/%m/%Y} a {fim_grafico:%d/%m/%Y}. '
+           f'Os cinco títulos do gráfico principal são os líderes de {ref:%d/%m/%Y}.')
+
 ofertas_do_dia = btg[btg.Data_Emissao.eq(pd.Timestamp(ref))].copy()
 lideres = pd.DataFrame()
 if ofertas_do_dia.empty:
@@ -231,7 +248,7 @@ else:
     if lideres.empty:
         st.info('Os títulos da Data Base estão pendentes de cálculo. Confira a cobertura das taxas.')
 
-comparar_inicio = st.checkbox('Comparar com o Top 5 de cada dia desde o início da base', value=False)
+comparar_inicio = st.checkbox('Comparar com o Top 5 de cada dia no período', value=False)
 if not lideres.empty or comparar_inicio:
     with st.spinner('Calculando as TAEs históricas por Data da Oferta...'):
         historico = carregar_historico(btg, selic, ipca, str(ref), estimar)
@@ -244,7 +261,11 @@ if not lideres.empty or comparar_inicio:
             historico = pd.concat([historico, atuais.reindex(columns=historico.columns)], ignore_index=True)
     if not lideres.empty:
         serie = series_lideres(historico, lideres, str(ref))
-        grafico_tae(serie)
+        serie = serie[serie.Data.between(pd.Timestamp(inicio_grafico), pd.Timestamp(fim_grafico))]
+        if serie.TAE_pct.notna().any():
+            grafico_tae(serie)
+        else:
+            st.info('Os cinco líderes não têm observações no período escolhido.')
         if serie.dropna(subset=['TAE_pct']).groupby('Serie').Data.nunique().lt(2).any():
             st.caption('Alguns líderes têm uma única observação identificável: aparecem como pontos, sem linha histórica artificial.')
         st.caption('Os mesmos cinco títulos líderes da Data Base são acompanhados no histórico. '
@@ -254,8 +275,9 @@ if not lideres.empty or comparar_inicio:
             st.caption('Para títulos sem código, o vínculo histórico exige os mesmos termos: '
                        'emissor, produto, vencimento, indexador, taxa e fluxo de pagamentos.')
     if comparar_inicio:
-        st.subheader('Top 5 de cada dia • Desde o início da base')
-        serie_diaria = series_top5_diario(historico)
+        st.subheader('Top 5 de cada dia • Período selecionado')
+        historico_periodo = historico[historico.Data_Emissao.between(pd.Timestamp(inicio_grafico), pd.Timestamp(fim_grafico))]
+        serie_diaria = series_top5_diario(historico_periodo)
         if serie_diaria.empty:
             st.info('Não há histórico calculável para a seleção.')
         else:
