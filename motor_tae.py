@@ -137,12 +137,16 @@ class MotorTAE:
         mensal = self.ipca.set_index(self.ipca.Data.dt.to_period('M'))['IPCA'].map(numero)/100
         # Histórico remunerado com a variação mensal anterior (defasagem M-1).
         mm = mensal.reindex(self.dias.to_period('M')-1).to_numpy(dtype=float)
-        self.falta_ipca = hist & ~np.isfinite(mm)
-        # Pró-rata geométrico mensal por dia corrido; não é VNA contratual.
-        infl_hist = np.log1p(mm)/self.dias.days_in_month.to_numpy()
+        self.falta_ipca = hist & self.du & ~np.isfinite(mm)
+        # Rateio mensal por DU; fatores anuais e anualização usam 252 DU.
+        meses = self.dias.to_period('M')
+        inicio_mes = meses.to_timestamp().values.astype('datetime64[D]')
+        fim_mes = (meses+1).to_timestamp().values.astype('datetime64[D]')
+        du_mes = np.busday_count(inicio_mes, fim_mes, busdaycal=cal)
+        infl_hist = np.where(self.du, np.log1p(mm)/du_mes, 0.)
         if config.permitir_estimativa_historica:
             infl_hist = np.where(self.falta_ipca,
-                                 np.log1p(self.ipca0)/np.where(self.dias.is_leap_year, 366, 365), infl_hist)
+                                 np.log1p(self.ipca0)/252, infl_hist)
         self.curvas = {}
         self.trajetorias = []
         for nome, sinal in [('Base', 0), ('Simulacao', 1), ('Choque', -1)]:
@@ -151,7 +155,7 @@ class MotorTAE:
             logs_ipca = np.array(infl_hist, dtype=float)
             futuro = ~hist
             cdi[futuro] = meta - config.diferencial_cdi_pp/100
-            logs_ipca[futuro] = np.log1p(infl)/np.where(self.dias.is_leap_year[futuro], 366, 365)
+            logs_ipca[futuro] = np.where(self.du[futuro], np.log1p(infl)/252, 0.)
             self.trajetorias.append(dict(Cenario=nome, Data=self.ref, Selic_pct=meta*100, IPCA_anual_pct=infl*100))
             for d, delta in zip(datas, choques):
                 nova = meta+sinal*delta/100
@@ -163,7 +167,7 @@ class MotorTAE:
                     raise ValueError('Trajetória gera fator de capitalização inválido.')
                 mask = self.dias >= d
                 cdi[mask] = meta-config.diferencial_cdi_pp/100
-                logs_ipca[mask] = np.log1p(infl)/np.where(self.dias.is_leap_year[mask], 366, 365)
+                logs_ipca[mask] = np.where(self.du[mask], np.log1p(infl)/252, 0.)
                 self.trajetorias.append(dict(Cenario=nome, Data=d, Selic_pct=meta*100, IPCA_anual_pct=infl*100))
             if not np.isfinite(meta) or meta <= 0:
                 raise ValueError('Selic inicial inválida.')
@@ -292,6 +296,8 @@ def calcular_ranking(btg, selic, ipca, config):
         raise ValueError('Base sem datas válidas.')
     motor = MotorTAE(selic, ipca, config, inicio, fim)
     saida = pd.DataFrame([motor.calcular(linha) for linha in base.to_dict('records')])
+    # Evita reter curvas de diferentes datas ao construir o histórico inteiro.
+    motor.acumuladores.cache_clear()
     # Evita colisão com resultados de uma execução anterior.
     resultado = pd.concat([base.drop(columns=base.columns.intersection(saida.columns)), saida], axis=1)
     valido = resultado.Status_Calculo.str.startswith('OK')
