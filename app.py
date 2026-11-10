@@ -11,6 +11,50 @@ st.set_page_config(page_title='Ranking de renda fixa | BTG', layout='wide')
 ROOT = Path(__file__).resolve().parent
 ARQUIVOS = ['BTG_Consolidado.xlsx', 'IPCA_OUTPUT.xlsx', 'SELIC_OUTPUT.xlsx']
 
+# Datas de início de vigência; não são datas de publicação da ata.
+AGENDA_COPOM = {
+    '2026-12-10': '08 e 09/12/2026',
+    '2027-01-28': '26 e 27/01/2027',
+    '2027-03-18': '16 e 17/03/2027',
+    '2027-04-29': '27 e 28/04/2027',
+    '2027-06-17': '15 e 16/06/2027',
+    '2027-08-05': '03 e 04/08/2027',
+    '2027-09-23': '21 e 22/09/2027',
+    '2027-10-28': '26 e 27/10/2027',
+    '2027-12-09': '07 e 08/12/2027',
+}
+
+
+def opcoes_copom(referencia, anterior=None, reservar=0):
+    limite = max(pd.Timestamp(referencia), pd.Timestamp(anterior)) if anterior else pd.Timestamp(referencia)
+    datas = [pd.Timestamp(d).date() for d in AGENDA_COPOM if pd.Timestamp(d) > limite]
+    return datas[:-reservar] if reservar else datas
+
+
+def tabela_comparativa(v):
+    colunas = ['Ranking_Base', 'Produto', 'Emissor', 'Indexador', 'Taxa', 'Data Vencimento',
+               'IR', 'TAE_Liquida_Base', 'TAE_Real_Base', 'Amplitude_TAE_pp',
+               'Mudanca_Ranking_Simulacao', 'Mudanca_Ranking_Choque', 'Situacao', 'Avisos']
+    vista = v[[x for x in colunas if x in v]].copy()
+    for tipo in ('Liquida', 'Real'):
+        base = f'TAE_{tipo}_Base'
+        if base not in v:
+            continue
+        vista[base] *= 100
+        for cenario in ('Simulacao', 'Choque'):
+            col = f'TAE_{tipo}_{cenario}'
+            if col not in v:
+                continue
+            delta = (v[col]-v[base])*100
+            # Colunas com variação zero em todos os títulos não agregam informação.
+            if delta.notna().any() and not np.allclose(delta.dropna(), 0, atol=1e-10, rtol=0):
+                vista[f'Variação TAE {tipo.lower()} {cenario} (p.p.)'] = delta
+    if 'IR' in vista:
+        vista['IR'] *= 100
+    return vista.rename(columns={'TAE_Liquida_Base':'TAE líquida base (% a.a.)',
+                                 'TAE_Real_Base':'TAE real base (% a.a.)', 'IR':'IR (%)'})
+
+
 
 @st.cache_data(show_spinner=False)
 def carregar(assinatura):
@@ -72,16 +116,27 @@ with st.sidebar:
         st.warning('Não há ofertas anteriores à referência escolhida.')
         st.stop()
     emissao = st.selectbox('Data da oferta / aquisição hipotética', emissoes, format_func=lambda d: d.strftime('%d/%m/%Y'))
+    disponiveis = opcoes_copom(ref)
+    limite_alteracoes = min(3, len(disponiveis))
+    if limite_alteracoes < 3:
+        st.warning('A agenda cadastrada precisa ser ampliada para oferecer três alterações após esta referência. '
+                   'Não serão criadas datas de reuniões não publicadas.')
+    quantidade = st.selectbox('Número de alterações', list(range(limite_alteracoes, -1, -1)))
+    ds = []
+    anterior = None
+    st.caption('Vigência da nova taxa: datas futuras do calendário Copom 2026–2027.')
+    for k in range(quantidade):
+        opcoes = opcoes_copom(ref, anterior, reservar=quantidade-k-1)
+        d = st.selectbox(f'{k+1}ª vigência da nova taxa', opcoes,
+                         format_func=lambda d: f'{d:%d/%m/%Y} • reunião {AGENDA_COPOM[d.isoformat()]}',
+                         key=f'copom_{k}_{ref}_{anterior}_{quantidade}')
+        ds.append(d)
+        anterior = d
     with st.form('parametros'):
         selic0 = st.number_input('Selic inicial simulada (% a.a.)', min_value=.25, max_value=40., value=13.25, step=.25)
         st.caption('Âncora manual. Não representa atualização automática da taxa vigente.')
-        quantidade = st.selectbox('Número de alterações', [3, 2, 1, 0])
-        # Os três campos sempre existem: mudanças dentro de formulário são aplicadas ao enviar.
-        ds, movimentos = [], []
-        st.caption('Preencha apenas as primeiras N datas. Informe o início da vigência da nova taxa.')
-        for k, padrao in enumerate((.25, .25, .5), start=1):
-            ds.append(st.date_input(f'{k}ª data de eficácia', value=None,
-                                    min_value=ref+timedelta(days=1), key=f'data_{k}'))
+        movimentos = []
+        for k, padrao in enumerate((.25, .25, .5)[:quantidade], start=1):
             movimentos.append(st.number_input(f'{k}ª alteração (p.p.)', min_value=-5., max_value=5.,
                                               value=padrao, step=.25, key=f'choque_{k}'))
         estimar = st.checkbox('Permitir estimativas em lacunas históricas', value=False,
@@ -96,7 +151,7 @@ if not enviar:
     st.info('Escolha a data da oferta, preencha até três datas futuras e clique em Calcular cenários. '
             'Selecione zero alterações para comparar os três cenários em manutenção.')
     st.caption('Configuração inicial: Selic 13,25%; movimentos +0,25, +0,25 e +0,50 p.p. '
-               'As datas devem ser escolhidas; não há calendário do Copom presumido.')
+               'As listas usam as datas de vigência da agenda cadastrada do Copom.')
     st.stop()
 if any(d is None for d in ds[:quantidade]):
     st.warning('Preencha as primeiras datas de eficácia correspondentes ao número de alterações.')
@@ -147,17 +202,10 @@ st.dataframe(trajetorias.rename(columns={'Selic_pct':'Selic (% a.a.)', 'IPCA_anu
 st.subheader('Comparação por título')
 if ok.any():
     v = resultado.loc[ok].sort_values('Ranking_Base').copy()
-    colunas = ['Ranking_Base', 'Produto', 'Emissor', 'Indexador', 'Taxa', 'Data Vencimento',
-               'TAE_Liquida_Base', 'TAE_Liquida_Simulacao', 'TAE_Liquida_Choque',
-               'TAE_Real_Base', 'TAE_Real_Simulacao', 'TAE_Real_Choque', 'Amplitude_TAE_pp',
-               'Mudanca_Ranking_Simulacao', 'Mudanca_Ranking_Choque', 'Situacao', 'Avisos']
-    vista = v[[x for x in colunas if x in v]].copy()
-    for x in vista.columns:
-        if x.startswith('TAE_'):
-            vista[x] = vista[x]*100
+    vista = tabela_comparativa(v)
     st.dataframe(vista, hide_index=True, use_container_width=True)
-    st.caption('TAEs exibidas em % a.a.; amplitude em p.p. Mudança positiva significa melhora no ranking. '
-               'O CSV completo usa retornos decimais: 0,12 significa 12%.')
+    st.caption('TAE base em % a.a.; diferenças dos cenários e amplitude em p.p. Colunas sem variação são ocultadas. '
+               'O IR é o mesmo nos três cenários; os rendimentos podem variar. O CSV completo usa retornos decimais: 0,12 = 12%.')
 else:
     st.info('Nenhum título passou pelas verificações. Veja as pendências abaixo.')
 
