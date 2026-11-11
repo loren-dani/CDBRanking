@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from motor_tae import Config, calcular_ranking, normalizar
-from analise_top5 import identificar, cinco_primeiros, historico_ofertas, series_lideres, series_top5_diario
+from analise_top5 import identificar, historico_ofertas, series_top5_diario
 
 st.set_page_config(page_title='Ranking de renda fixa | BTG', layout='wide')
 ROOT = Path(__file__).resolve().parent
@@ -29,28 +29,84 @@ def opcoes_copom(referencia, anterior=None, reservar=0):
     return datas[:-reservar] if reservar else datas
 
 
-def tabela_comparativa(v):
-    colunas = ['Ranking_Base', 'Produto', 'Emissor', 'Indexador', 'Taxa', 'Data Vencimento',
-               'IR', 'TAE_Liquida_Base', 'TAE_Real_Base']
+CENARIOS = {'Base':'Base', 'Simulacao':'Simulação', 'Choque':'Choque'}
+
+
+def ordenar_ranking(resultado, cenario):
+    if cenario not in CENARIOS:
+        raise ValueError('Cenário inválido.')
+    rank, tae = f'Ranking_{cenario}', f'TAE_Liquida_{cenario}'
+    validos = resultado[resultado.Status_Calculo.str.startswith('OK')].copy()
+    if validos.empty:
+        return validos
+    return validos.sort_values([rank, tae, 'DC'], ascending=[True, False, True], kind='stable')
+
+
+def top5_cenario(resultado, cenario):
+    ordenados = ordenar_ranking(resultado, cenario)
+    if ordenados.empty:
+        return ordenados
+    return identificar(ordenados).drop_duplicates('_chave_titulo').head(5)
+
+
+def tabela_comparativa(v, cenario):
+    rank = f'Ranking_{cenario}'
+    colunas = [rank, 'Produto', 'Emissor', 'Indexador', 'Taxa', 'Data Vencimento', 'IR',
+               f'TAE_Liquida_{cenario}', f'TAE_Real_{cenario}']
     vista = v[[x for x in colunas if x in v]].copy()
-    for tipo in ('Liquida', 'Real'):
-        base = f'TAE_{tipo}_Base'
-        if base not in v:
+    nomes = {rank:f'Posição — {CENARIOS[cenario]}', 'IR':'IR (%)'}
+    for tipo, nome in [('Liquida', 'líquida'), ('Real', 'real')]:
+        referencia = f'TAE_{tipo}_{cenario}'
+        if referencia not in v:
             continue
-        vista[base] *= 100
-        for cenario in ('Simulacao', 'Choque'):
-            col = f'TAE_{tipo}_{cenario}'
-            if col not in v:
+        vista[referencia] *= 100
+        nomes[referencia] = f'TAE {nome} — {CENARIOS[cenario]} (% a.a.)'
+        for outro in CENARIOS:
+            if outro == cenario or f'TAE_{tipo}_{outro}' not in v:
                 continue
-            delta = (v[col]-v[base])*100
+            delta = (v[f'TAE_{tipo}_{outro}']-v[referencia])*100
             if delta.notna().any() and not np.allclose(delta.dropna(), 0, atol=1e-10, rtol=0):
-                vista[f'Variação TAE {tipo.lower()} {cenario} (p.p.)'] = delta
+                vista[f'Δ TAE {nome} {CENARIOS[outro]} (p.p.)'] = delta
     if 'IR' in vista:
         vista['IR'] *= 100
     if 'Amplitude_TAE_pp' in v:
         vista['Amplitude_TAE'] = v['Amplitude_TAE_pp']
-    return vista.rename(columns={'TAE_Liquida_Base':'TAE líquida base (% a.a.)',
-                                 'TAE_Real_Base':'TAE real base (% a.a.)', 'IR':'IR (%)'})
+    return vista.rename(columns=nomes)
+
+
+def dados_barras(lideres, cenario):
+    r = lideres.copy().reset_index(drop=True)
+    r['Ordem'] = np.arange(1,len(r)+1)
+    r['TAE_pct'] = r[f'TAE_Liquida_{cenario}']*100
+    r['Spread_lider_pp'] = r.TAE_pct-r.TAE_pct.max()
+    r['Spread_anterior_pp'] = r.TAE_pct.diff().fillna(0)
+    r['Titulo'] = [f"{k}º · {linha.get('Produto','')} · {linha.get('Emissor','')} · "
+                   f"{pd.Timestamp(linha['Data Vencimento']):%d/%m/%Y}"
+                   for k,linha in enumerate(r.to_dict('records'),start=1)]
+    r['Rotulo'] = [f'{tae:.2f}% | {gap:+.3f} p.p.'.replace('.',',')
+                    for tae,gap in zip(r.TAE_pct,r.Spread_lider_pp)]
+    return r
+
+
+def grafico_barras(lideres, cenario):
+    dados = dados_barras(lideres, cenario)
+    st.vega_lite_chart(dados, {
+        'height': max(170,len(dados)*46), 'padding':{'right':160},
+        'encoding': {
+            'y':{'field':'Titulo','type':'nominal','sort':{'field':'Ordem','order':'ascending'},
+                 'title':None,'axis':{'labelLimit':440}},
+            'x':{'field':'TAE_pct','type':'quantitative','title':'TAE líquida (% a.a.)','scale':{'zero':True}},
+            'tooltip':[{'field':'Titulo','type':'nominal','title':'Título'},
+                       {'field':'TAE_pct','type':'quantitative','title':'TAE líquida (% a.a.)','format':'.4f'},
+                       {'field':'Spread_lider_pp','type':'quantitative','title':'Diferença para o líder (p.p.)','format':'.4f'},
+                       {'field':'Spread_anterior_pp','type':'quantitative','title':'Diferença para o anterior (p.p.)','format':'.4f'}]},
+        'layer':[{'mark':{'type':'bar','color':'#1677C8','cornerRadiusEnd':3}},
+                 {'mark':{'type':'text','align':'left','dx':6,'clip':False},
+                  'encoding':{'text':{'field':'Rotulo','type':'nominal'}}}]
+    }, use_container_width=True)
+    st.caption('Rótulos: TAE líquida | diferença para o primeiro colocado, em p.p. '
+               'O tooltip também mostra a diferença para o colocado anterior. '
+               f'Distância entre o primeiro e o último exibido: {dados.TAE_pct.max()-dados.TAE_pct.min():.3f} p.p.')
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -202,89 +258,74 @@ a.metric('Títulos da data', len(resultado))
 b.metric('Calculados', int(ok.sum()))
 c.metric('Pendentes', int((~ok).sum()))
 st.subheader('Comparação por título')
+cenario_ordenacao = st.selectbox('Ordenar ranking por cenário', list(CENARIOS),
+                                format_func=lambda x:CENARIOS[x], key='cenario_ordenacao')
 if ok.any():
-    v = resultado.loc[ok].sort_values('Ranking_Base').copy()
-    vista = tabela_comparativa(v)
+    v = ordenar_ranking(resultado, cenario_ordenacao)
+    vista = tabela_comparativa(v, cenario_ordenacao)
     st.dataframe(vista, hide_index=True, use_container_width=True)
-    st.caption('TAE base em % a.a.; diferenças dos cenários e amplitude em p.p. Colunas sem variação são ocultadas. '
+    st.caption(f'Ordenação e TAEs principais: {CENARIOS[cenario_ordenacao]}. As diferenças dos outros cenários são relativas a ele, em p.p. '
                'O IR é o mesmo nos três cenários; os rendimentos podem variar. O CSV completo usa retornos decimais: 0,12 = 12%.')
 else:
     st.info('Nenhum título passou pelas verificações. Veja as pendências abaixo.')
 
 with st.expander('Resumo das pendências', expanded=not bool(ok.any())):
     st.dataframe(resultado.Status_Calculo.value_counts().rename_axis('Status').reset_index(name='Quantidade'), hide_index=True)
-st.download_button('Baixar cálculo completo (CSV)', resultado.to_csv(index=False).encode('utf-8-sig'),
+exportacao = resultado.sort_values(f'Ranking_{cenario_ordenacao}', na_position='last', kind='stable')
+st.download_button('Baixar cálculo completo (CSV)', exportacao.to_csv(index=False).encode('utf-8-sig'),
                    file_name=f'ranking_{emissao}_{ref}.csv', mime='text/csv', on_click='ignore')
-st.subheader('Evolução da TAE • Top 5 da Data Base')
-primeira_emissao = btg.Data_Emissao.min().date()
-modo_periodo = st.radio('Período dos gráficos', ['Desde o início da base', 'Escolher período'], horizontal=True)
-inicio_grafico, fim_grafico = primeira_emissao, ref
-if modo_periodo == 'Escolher período':
-    esquerda, direita = st.columns(2)
-    with esquerda:
-        inicio_grafico = st.date_input('Início do gráfico', value=primeira_emissao,
-                                       min_value=primeira_emissao, max_value=ref)
-    with direita:
-        fim_grafico = st.date_input('Fim do gráfico', value=ref,
-                                    min_value=primeira_emissao, max_value=ref)
-    if inicio_grafico > fim_grafico:
-        st.warning('O início do gráfico deve ser anterior ou igual ao fim.')
-        st.stop()
-st.caption(f'Período exibido: {inicio_grafico:%d/%m/%Y} a {fim_grafico:%d/%m/%Y}. '
-           f'Os cinco títulos do gráfico principal são os líderes de {ref:%d/%m/%Y}.')
-
+st.subheader(f'Top 5 da Data Base • {CENARIOS[cenario_ordenacao]}')
+st.caption(f'Data Base: {ref:%d/%m/%Y}. As barras usam o mesmo cenário selecionado para ordenar a tabela.')
 ofertas_do_dia = btg[btg.Data_Emissao.eq(pd.Timestamp(ref))].copy()
-lideres = pd.DataFrame()
+ranking_dia = pd.DataFrame()
 if ofertas_do_dia.empty:
-    st.info(f'Não há ofertas em {ref:%d/%m/%Y} no BTG Consolidado. '
-            'Atualize a base para exibir o Top 5 do dia ou escolha uma Data Base histórica. '
-            'A tabela acima pertence à Data da Oferta selecionada.')
+    st.info('Não há ofertas da Data Base disponíveis.')
 else:
     if emissao == ref:
         ranking_dia = resultado
     else:
         ranking_dia, _ = simular(ofertas_do_dia, selic, ipca, config)
-    lideres = cinco_primeiros(ranking_dia)
+    lideres = top5_cenario(ranking_dia, cenario_ordenacao)
     if lideres.empty:
         st.info('Os títulos da Data Base estão pendentes de cálculo. Confira a cobertura das taxas.')
+    else:
+        grafico_barras(lideres, cenario_ordenacao)
 
 comparar_inicio = st.checkbox('Comparar com o Top 5 de cada dia no período', value=False)
-if not lideres.empty or comparar_inicio:
+if comparar_inicio:
+    st.subheader('Top 5 de cada dia • Histórico')
+    primeira_emissao = btg.Data_Emissao.min().date()
+    modo_periodo = st.radio('Período do histórico', ['Desde o início da base', 'Escolher período'], horizontal=True)
+    inicio_grafico, fim_grafico = primeira_emissao, ref
+    if modo_periodo == 'Escolher período':
+        esquerda, direita = st.columns(2)
+        with esquerda:
+            inicio_grafico = st.date_input('Início do gráfico', value=primeira_emissao,
+                                           min_value=primeira_emissao, max_value=ref)
+        with direita:
+            fim_grafico = st.date_input('Fim do gráfico', value=ref,
+                                        min_value=primeira_emissao, max_value=ref)
+        if inicio_grafico > fim_grafico:
+            st.warning('O início do gráfico deve ser anterior ou igual ao fim.')
+            st.stop()
     with st.spinner('Calculando as TAEs históricas por Data da Oferta...'):
         historico = carregar_historico(btg, selic, ipca, str(ref), estimar)
-    if not ofertas_do_dia.empty:
-        # A Data Base usa a configuração atual nos DOIS gráficos.
-        hoje_validos = ranking_dia[ranking_dia.Status_Calculo.str.startswith('OK')]
+    if not ranking_dia.empty:
+        atuais = ordenar_ranking(ranking_dia, cenario_ordenacao)
         historico = historico[~historico.Data_Emissao.eq(pd.Timestamp(ref))].copy()
-        if not hoje_validos.empty:
-            atuais = identificar(hoje_validos)
+        if not atuais.empty:
+            atuais = identificar(atuais)
+            atuais['TAE_Liquida_Base'] = atuais[f'TAE_Liquida_{cenario_ordenacao}']
             historico = pd.concat([historico, atuais.reindex(columns=historico.columns)], ignore_index=True)
-    if not lideres.empty:
-        serie = series_lideres(historico, lideres, str(ref))
-        serie = serie[serie.Data.between(pd.Timestamp(inicio_grafico), pd.Timestamp(fim_grafico))]
-        if serie.TAE_pct.notna().any():
-            grafico_tae(serie)
-        else:
-            st.info('Os cinco líderes não têm observações no período escolhido.')
-        if serie.dropna(subset=['TAE_pct']).groupby('Serie').Data.nunique().lt(2).any():
-            st.caption('Alguns líderes têm uma única observação identificável: aparecem como pontos, sem linha histórica artificial.')
-        st.caption('Os mesmos cinco títulos líderes da Data Base são acompanhados no histórico. '
-                   'Cada ponto anterior usa taxas disponíveis naquela Data da Oferta; o último usa '
-                   'a configuração da Data Base. Datas sem observação ficam em branco.')
-        if lideres['_chave_titulo'].str.startswith('TERMOS:').any():
-            st.caption('Para títulos sem código, o vínculo histórico exige os mesmos termos: '
-                       'emissor, produto, vencimento, indexador, taxa e fluxo de pagamentos.')
-    if comparar_inicio:
-        st.subheader('Top 5 de cada dia • Período selecionado')
-        historico_periodo = historico[historico.Data_Emissao.between(pd.Timestamp(inicio_grafico), pd.Timestamp(fim_grafico))]
-        serie_diaria = series_top5_diario(historico_periodo)
-        if serie_diaria.empty:
-            st.info('Não há histórico calculável para a seleção.')
-        else:
-            grafico_tae(serie_diaria)
-            st.caption('Cada linha representa uma posição entre os cinco primeiros em cada Data da Oferta. '
-                       'Os títulos que ocupam cada posição podem mudar. As TAEs históricas usam '
-                       'a taxa spot elegível na própria data, sem antecipar taxas realizadas no futuro.')
+    historico_periodo = historico[historico.Data_Emissao.between(pd.Timestamp(inicio_grafico), pd.Timestamp(fim_grafico))]
+    serie_diaria = series_top5_diario(historico_periodo)
+    if serie_diaria.empty:
+        st.info('Não há histórico calculável para a seleção.')
+    else:
+        grafico_tae(serie_diaria)
+        st.caption('Cada linha representa uma posição entre os cinco primeiros em cada Data da Oferta. '
+                   'Os ocupantes podem mudar. Datas anteriores usam o cenário spot da própria data; '
+                   f'a Data Base usa {CENARIOS[cenario_ordenacao]}. Os choques futuros não são aplicados retroativamente.')
 
 with st.expander('Como interpretar'):
     st.markdown('O fator histórico é multiplicado pelo fator futuro. O IR é calculado sobre o '
